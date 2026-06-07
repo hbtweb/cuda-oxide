@@ -1,0 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "slice_rawptr_aggregate"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+
+# Standalone crate, not part of the parent workspace.
+[workspace]
+
+# Regression guard for `&y0[1..]` subslicing, which lowers to a
+# `Rvalue::Aggregate(AggregateKind::RawPtr(Slice(T), mut), [data_ptr, len])`.
+# The importer had no `RawPtr` arm and rejected it with
+# `Aggregate kind RawPtr(...) not yet supported`; `MirInsertFieldOp::verify`
+# also rejected the `MirSliceType` aggregate. Both are fixed.
+#
+# Build with:
+#   cargo oxide run slice_rawptr_aggregate
+
+[dependencies]
+cuda-core = { path = "../../../cuda-core" }
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }

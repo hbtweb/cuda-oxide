@@ -1409,6 +1409,121 @@ pub fn translate_rvalue(
                         Ok((Some(op), result, prev_after_casts))
                     }
                 }
+                mir::AggregateKind::RawPtr(pointee_ty, _mutability) => {
+                    // `&y0[1..]` (and other slice subslicing) lowers to
+                    // `Rvalue::Aggregate(RawPtr(pointee, mut), [data_ptr, meta])`.
+                    // For a `[T]` pointee the result is a `{ptr, len}` fat
+                    // pointer == `MirSliceType`; meta is the element length.
+                    // operands[0] = thin data pointer, operands[1] = length.
+                    match pointee_ty.kind() {
+                        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Slice(
+                            elem_ty,
+                        )) => {
+                            let element_type = types::translate_type(ctx, &elem_ty)?;
+                            let slice_ty: Ptr<TypeObj> =
+                                dialect_mir::types::MirSliceType::get(ctx, element_type).into();
+                            // Field 0 ptr type: generic-addrspace ptr to element
+                            // (mirrors slice field-0 extraction elsewhere).
+                            let field0_ptr_ty = dialect_mir::types::MirPtrType::get_generic(
+                                ctx,
+                                element_type,
+                                true,
+                            )
+                            .into();
+
+                            let mut current_prev_op = prev_op;
+
+                            // Translate the data pointer (operand 0).
+                            let (data_ptr, new_prev_op) = translate_operand(
+                                ctx,
+                                body,
+                                &operands[0],
+                                value_map,
+                                block_ptr,
+                                current_prev_op,
+                                loc.clone(),
+                            )?;
+                            // Normalize the data pointer to the generic address
+                            // space if needed (as the Array/Struct arms do).
+                            let (data_ptr, new_prev_op) = cast_to_generic_addrspace_if_needed(
+                                ctx,
+                                data_ptr,
+                                field0_ptr_ty,
+                                block_ptr,
+                                new_prev_op,
+                                loc.clone(),
+                            );
+                            current_prev_op = new_prev_op;
+
+                            // Translate the length metadata (operand 1).
+                            let (len_val, new_prev_op) = translate_operand(
+                                ctx,
+                                body,
+                                &operands[1],
+                                value_map,
+                                block_ptr,
+                                current_prev_op,
+                                loc.clone(),
+                            )?;
+                            current_prev_op = new_prev_op;
+
+                            // undef(slice_ty) -> insert ptr@0 -> insert len@1
+                            let undef = dialect_mir::ops::MirUndefOp::new(ctx, slice_ty);
+                            let undef_op = undef.get_operation();
+                            match current_prev_op {
+                                Some(prev) => undef_op.insert_after(ctx, prev),
+                                None => undef_op.insert_at_front(block_ptr, ctx),
+                            }
+                            let undef_val = undef_op.deref(ctx).get_result(0);
+
+                            let insert_ptr_op = Operation::new(
+                                ctx,
+                                dialect_mir::ops::MirInsertFieldOp::get_concrete_op_info(),
+                                vec![slice_ty],
+                                vec![undef_val, data_ptr],
+                                vec![],
+                                0,
+                            );
+                            insert_ptr_op.deref_mut(ctx).set_loc(loc.clone());
+                            let insert_ptr = dialect_mir::ops::MirInsertFieldOp::new(insert_ptr_op);
+                            insert_ptr.set_attr_insert_index(
+                                ctx,
+                                dialect_mir::attributes::FieldIndexAttr(0),
+                            );
+                            insert_ptr_op.insert_after(ctx, undef_op);
+                            let val_with_ptr = insert_ptr_op.deref(ctx).get_result(0);
+
+                            let insert_len_op = Operation::new(
+                                ctx,
+                                dialect_mir::ops::MirInsertFieldOp::get_concrete_op_info(),
+                                vec![slice_ty],
+                                vec![val_with_ptr, len_val],
+                                vec![],
+                                0,
+                            );
+                            insert_len_op.deref_mut(ctx).set_loc(loc.clone());
+                            let insert_len = dialect_mir::ops::MirInsertFieldOp::new(insert_len_op);
+                            insert_len.set_attr_insert_index(
+                                ctx,
+                                dialect_mir::attributes::FieldIndexAttr(1),
+                            );
+                            // Do NOT insert `insert_len_op` here: by the
+                            // `translate_rvalue` contract the first tuple
+                            // element is the (still-unlinked) op the caller
+                            // inserts after `last_inserted` (third element).
+                            let result = insert_len_op.deref(ctx).get_result(0);
+
+                            Ok((Some(insert_len_op), result, Some(insert_ptr_op)))
+                        }
+                        _ => input_err!(
+                            loc,
+                            TranslationErr::unsupported(format!(
+                                "Aggregate kind RawPtr with non-slice pointee {:?} not yet supported",
+                                pointee_ty.kind()
+                            ))
+                        ),
+                    }
+                }
                 _ => {
                     input_err!(
                         loc,
@@ -3300,6 +3415,12 @@ fn element_rust_ty(ty: rustc_public::ty::Ty) -> TranslationResult<rustc_public::
     use rustc_public::ty::{RigidTy, TyKind};
     match ty.kind() {
         TyKind::RigidTy(RigidTy::Array(elem, _)) | TyKind::RigidTy(RigidTy::Slice(elem)) => Ok(elem),
+        // `s[i]` on a `&[T]` / `*[T]` reaches the Index projection with the
+        // running type still at the reference/raw-pointer (the preceding Deref
+        // is a no-op for the type), so peel one indirection and retry.
+        TyKind::RigidTy(RigidTy::Ref(_, inner, _)) | TyKind::RigidTy(RigidTy::RawPtr(inner, _)) => {
+            element_rust_ty(inner)
+        }
         other => input_err_noloc!(TranslationErr::unsupported(format!(
             "Index on non-array/slice type: {:?}",
             other

@@ -389,10 +389,40 @@ impl Verify for MirInsertFieldOp {
                     new_value_ty.disp(ctx)
                 );
             }
+        } else if let Some(slice_ty) = aggregate_ty_obj.downcast_ref::<MirSliceType>() {
+            // Slice fat pointer: field 0 = *T (ptr to element), field 1 = usize
+            // (len). Mirrors the MirSliceType arm in MirExtractFieldOp::verify.
+            // Used when building a `&[T]` from a RawPtr aggregate.
+            if index == 0 {
+                let new_value_ty_obj = new_value_ty.deref(ctx);
+                if let Some(ptr_ty) = new_value_ty_obj.downcast_ref::<MirPtrType>() {
+                    if ptr_ty.pointee != slice_ty.element_ty {
+                        return verify_err!(
+                            op.loc(),
+                            "MirInsertFieldOp value type mismatch for slice ptr"
+                        );
+                    }
+                } else {
+                    return verify_err!(
+                        op.loc(),
+                        "MirInsertFieldOp value must be ptr for slice field 0"
+                    );
+                }
+            } else if index == 1 {
+                let new_value_ty_obj = new_value_ty.deref(ctx);
+                if new_value_ty_obj.downcast_ref::<IntegerType>().is_none() {
+                    return verify_err!(
+                        op.loc(),
+                        "MirInsertFieldOp value must be integer for slice len"
+                    );
+                }
+            } else {
+                return verify_err!(op.loc(), "MirInsertFieldOp index out of bounds for slice");
+            }
         } else {
             return verify_err!(
                 op.loc(),
-                "MirInsertFieldOp aggregate operand must be tuple, struct, or array"
+                "MirInsertFieldOp aggregate operand must be tuple, struct, array, or slice"
             );
         }
 
