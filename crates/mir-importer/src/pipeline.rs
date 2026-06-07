@@ -372,27 +372,49 @@ pub fn run_pipeline(
     // The example is then expected to feed the `.ll` through the LTOIR
     // pipeline (compile_ltoir + link_ltoir) and load the resulting cubin.
     let needs_libdevice = module_uses_libdevice(&ctx, module_op_ptr);
-    let emit_nvvm_ir = config.emit_nvvm_ir || needs_libdevice;
+    // Decouple two concerns that used to share one bool:
+    //   * `export_config` — which `ExportBackendConfig` shapes the `.ll`.
+    //   * `skip_llc` — stop before `llc → .ptx` and hand the `.ll` to the
+    //     libNVVM/nvJitLink consumer. True whenever NVVM IR was requested OR
+    //     libdevice was auto-detected.
+    // Auto-detected libdevice must NOT reuse the explicit `NvvmExportConfig`:
+    // its verbose datalayout makes `nvvmCompileProgram` fail with `code 9
+    // "parse expected type"` and it drops the `ptx_kernel` calling convention.
+    // libNVVM needs the canonical PTX datalayout + `ptx_kernel` CC, but it also
+    // needs `!nvvmir.version` (to parse the opaque-pointer NVVM 2.0 dialect)
+    // and `@llvm.used` (to keep the kernel through LTO) — none of which the
+    // plain `PtxExportConfig` emits. `LibdeviceExportConfig` is exactly that
+    // combination, so select it for the auto-detect case.
+    let export_config = if config.emit_nvvm_ir {
+        ExportConfigKind::Nvvm
+    } else if needs_libdevice {
+        ExportConfigKind::Libdevice
+    } else {
+        ExportConfigKind::Ptx
+    };
+    let skip_llc = config.emit_nvvm_ir || needs_libdevice;
     if needs_libdevice && !config.emit_nvvm_ir && config.verbose {
         eprintln!(
             "\n=== Detected CUDA libdevice (`__nv_*`) calls; \
-             auto-emitting NVVM IR (skip llc) ==="
+             auto-emitting NVVM IR for libNVVM (skip llc) ==="
         );
     }
 
     // Step 7: Export to LLVM IR
     if config.verbose {
-        let mode = if emit_nvvm_ir { "NVVM IR" } else { "PTX" };
-        eprintln!("\n=== Exporting to LLVM IR ({} mode) ===", mode);
+        eprintln!(
+            "\n=== Exporting to LLVM IR ({} mode) ===",
+            export_config.mode_label()
+        );
     }
     let ll_path = config.output_dir.join(format!("{}.ll", config.output_name));
-    let _llvm_ir = export_llvm_ir(&ctx, module_op_ptr, device_externs, &ll_path, emit_nvvm_ir)?;
+    let _llvm_ir = export_llvm_ir(&ctx, module_op_ptr, device_externs, &ll_path, export_config)?;
     if config.verbose {
         eprintln!("LLVM IR written to {}", ll_path.display());
     }
 
     // Step 8: Generate PTX or stop at NVVM IR for libNVVM-owned paths.
-    if emit_nvvm_ir {
+    if skip_llc {
         // Skip llc. Return a would-be ptx_path so callers see a stable shape;
         // the file does not exist and the consumer must build its own cubin
         // from `ll_path` via libNVVM + nvJitLink.
@@ -614,11 +636,37 @@ fn llvm_type_string_to_pliron(ctx: &mut Context, type_str: &str) -> Ptr<pliron::
     }
 }
 
+/// Which export backend config shapes the emitted `.ll`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportConfigKind {
+    /// Standard PTX generation via `llc` (`PtxExportConfig`).
+    Ptx,
+    /// Explicitly-requested NVVM IR (`NvvmExportConfig`): verbose datalayout,
+    /// non-`ptx_kernel` CC.
+    Nvvm,
+    /// Auto-detected libdevice path consumed by libNVVM/nvJitLink
+    /// (`LibdeviceExportConfig`): canonical PTX datalayout + `ptx_kernel` CC,
+    /// but with `!nvvmir.version` + `@llvm.used` kept for libNVVM.
+    Libdevice,
+}
+
+impl ExportConfigKind {
+    fn mode_label(self) -> &'static str {
+        match self {
+            ExportConfigKind::Ptx => "PTX",
+            ExportConfigKind::Nvvm => "NVVM IR",
+            ExportConfigKind::Libdevice => "libdevice NVVM IR",
+        }
+    }
+}
+
 /// Exports an LLVM dialect module to textual LLVM IR (`.ll` file).
 ///
-/// Backend configuration is selected based on flags:
-/// - `emit_nvvm_ir`: Uses `NvvmExportConfig` for NVVM IR output
-/// - Otherwise: Uses default `PtxExportConfig` for standard PTX generation
+/// The backend configuration is selected by `kind`:
+/// - [`ExportConfigKind::Ptx`]: `PtxExportConfig` for standard PTX via `llc`.
+/// - [`ExportConfigKind::Nvvm`]: `NvvmExportConfig` for explicit NVVM IR.
+/// - [`ExportConfigKind::Libdevice`]: `LibdeviceExportConfig` for the
+///   auto-detected libdevice path consumed by libNVVM + nvJitLink.
 ///
 /// Device extern declarations are emitted before the main module content.
 fn export_llvm_ir(
@@ -626,19 +674,27 @@ fn export_llvm_ir(
     module_op_ptr: Ptr<Operation>,
     device_externs: &[DeviceExternDecl],
     path: &Path,
-    emit_nvvm_ir: bool,
+    kind: ExportConfigKind,
 ) -> Result<String, PipelineError> {
     let module_op = Operation::get_op::<pliron::builtin::ops::ModuleOp>(module_op_ptr, ctx)
         .ok_or_else(|| PipelineError::Export("Not a module op".to_string()))?;
 
-    let llvm_ir = if emit_nvvm_ir {
-        let config = llvm_export::export::NvvmExportConfig;
-        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-            .map_err(PipelineError::Export)?
-    } else {
-        let config = llvm_export::export::PtxExportConfig;
-        llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
-            .map_err(PipelineError::Export)?
+    let llvm_ir = match kind {
+        ExportConfigKind::Ptx => {
+            let config = llvm_export::export::PtxExportConfig;
+            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+                .map_err(PipelineError::Export)?
+        }
+        ExportConfigKind::Nvvm => {
+            let config = llvm_export::export::NvvmExportConfig;
+            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+                .map_err(PipelineError::Export)?
+        }
+        ExportConfigKind::Libdevice => {
+            let config = llvm_export::export::LibdeviceExportConfig;
+            llvm_export::export::export_module_with_externs(ctx, &module_op, device_externs, &config)
+                .map_err(PipelineError::Export)?
+        }
     };
 
     std::fs::write(path, &llvm_ir).map_err(|e| PipelineError::Export(e.to_string()))?;

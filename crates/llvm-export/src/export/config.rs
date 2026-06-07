@@ -115,3 +115,49 @@ impl ExportBackendConfig for NvvmExportConfig {
         false
     }
 }
+
+/// Export configuration for the auto-detected libdevice path.
+///
+/// When a kernel uses Rust float-math intrinsics, cuda-oxide lowers them to
+/// `__nv_*` libdevice calls, skips `llc`, and hands the `.ll` to the
+/// libNVVM + nvJitLink consumer (`cuda-host::ltoir`). That consumer needs:
+///
+/// * The canonical PTX datalayout + the `ptx_kernel` calling convention.
+///   The verbose `NvvmExportConfig` datalayout makes `nvvmCompileProgram`
+///   fail with `code 9 "parse expected type"`, and dropping `ptx_kernel`
+///   loses the kernel's entry-point CC.
+/// * `!nvvmir.version` metadata so libNVVM parses the module in its NVVM 2.0
+///   (opaque-pointer) dialect. Without it libNVVM falls back to a dialect
+///   that rejects opaque `ptr` operands (parse error on the first `ptr`),
+///   and `@llvm.used` to keep the kernel alive through LTO.
+///
+/// So it is exactly `NvvmExportConfig` EXCEPT for the datalayout (PTX form)
+/// and the `ptx_kernel` calling convention (enabled).
+#[derive(Clone, Debug, Default)]
+pub struct LibdeviceExportConfig;
+
+impl ExportBackendConfig for LibdeviceExportConfig {
+    fn datalayout(&self) -> &str {
+        NVPTX_DATALAYOUT_PTX
+    }
+
+    fn emit_llvm_used(&self) -> bool {
+        true
+    }
+
+    fn emit_nvvmir_version(&self) -> bool {
+        true
+    }
+
+    fn nvvmir_version(&self) -> [i32; 4] {
+        [2, 0, 3, 2] // NVVM IR 2.0, debug 3.2
+    }
+
+    fn emit_all_kernel_annotations(&self) -> bool {
+        true
+    }
+
+    fn emit_ptx_kernel_keyword(&self) -> bool {
+        true
+    }
+}
