@@ -47,6 +47,86 @@ fn anyhow_to_pliron(e: anyhow::Error) -> pliron::result::Error {
     pliron::input_error_noloc!("{e}")
 }
 
+/// True when the operand's current type is an already-lowered, non-opaque LLVM
+/// struct. Its fields are in final memory order (ZSTs already stripped, padding
+/// already materialized), so the declaration index maps to the LLVM index
+/// directly with no further remap. Used as the *only* safe identity fallback
+/// when the MIR struct/tuple type has dropped out of the type-history.
+fn is_lowered_llvm_struct(ctx: &Context, value: pliron::value::Value) -> bool {
+    value
+        .get_type(ctx)
+        .deref(ctx)
+        .downcast_ref::<llvm_export::types::StructType>()
+        .is_some_and(|s| !s.is_opaque())
+}
+
+/// Map a declaration-order field index to its LLVM struct field index.
+///
+/// Mirrors exactly the struct the type converter builds: non-ZST fields are
+/// emitted in memory order, and for explicit (`repr(Rust)`) layouts a `[N x i8]`
+/// padding field is inserted whenever the running offset is behind a field's
+/// byte offset (see `build_struct_with_explicit_padding`). Without accounting
+/// for that padding the index is off; without honoring `mem_to_decl` the
+/// reordered fields are mismatched.
+///
+/// `field_offsets` is `Some(..)` (per declaration-order field) for explicit
+/// layouts, `None` otherwise.
+/// Returns `Ok(None)` when the target field is zero-sized (no LLVM slot).
+fn llvm_field_index(
+    ctx: &mut Context,
+    field_types: &[Ptr<TypeObj>],
+    mem_to_decl: &[usize],
+    field_offsets: Option<&[u64]>,
+    decl_index: usize,
+) -> Result<Option<u32>> {
+    let mem_index = match mem_to_decl.iter().position(|&d| d == decl_index) {
+        Some(i) => i,
+        None => return pliron::input_err_noloc!("field index {decl_index} not in memory order"),
+    };
+
+    let target_ty = convert_type(ctx, field_types[decl_index]).map_err(anyhow_to_pliron)?;
+    if is_zero_sized_type(ctx, target_ty) {
+        return Ok(None);
+    }
+
+    if let Some(field_offsets) = field_offsets {
+        // Walk memory order, inserting a padding slot whenever the running
+        // offset trails the field's offset, counting LLVM positions up to the
+        // target field.
+        let mut llvm_idx = 0u32;
+        let mut current_offset = 0u64;
+        for slot in 0..mem_index {
+            let decl_idx = mem_to_decl[slot];
+            let off = field_offsets[decl_idx];
+            if current_offset < off {
+                llvm_idx += 1; // `[N x i8]` padding field
+                current_offset = off;
+            }
+            let llvm_ty = convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
+            if !is_zero_sized_type(ctx, llvm_ty) {
+                llvm_idx += 1;
+                current_offset += crate::convert::types::get_type_size(ctx, llvm_ty);
+            }
+        }
+        // Padding immediately before the target field, if any.
+        if current_offset < field_offsets[decl_index] {
+            llvm_idx += 1;
+        }
+        return Ok(Some(llvm_idx));
+    }
+
+    // Non-explicit layout: just the non-ZST fields in memory order.
+    let mut llvm_idx = 0u32;
+    for slot in 0..mem_index {
+        let decl_idx = mem_to_decl[slot];
+        let llvm_ty = convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
+        if !is_zero_sized_type(ctx, llvm_ty) {
+            llvm_idx += 1;
+        }
+    }
+    Ok(Some(llvm_idx))
+}
+
 /// Convert `mir.extract_field` to `llvm.extractvalue`.
 ///
 /// Handles scalar-lowered newtype case: if the operand is a scalar (e.g., `ThreadIndex`),
@@ -63,7 +143,6 @@ pub(crate) fn convert_extract_field(
     operands_info: &OperandsInfo,
 ) -> Result<()> {
     let aggregate = op.deref(ctx).get_operand(0);
-    let result = op.deref(ctx).get_result(0);
 
     let is_scalar = aggregate
         .get_type(ctx)
@@ -82,56 +161,52 @@ pub(crate) fn convert_extract_field(
         None => return pliron::input_err_noloc!("Missing index attribute on extract_field"),
     };
 
-    let (field_types, mem_to_decl) = {
+    // Recover the operand's declaration-order field types, memory order, and
+    // (for explicit layouts) padding info. Never fall back to an identity
+    // mapping: that emits the wrong index for reordered/padded repr(Rust)
+    // structs whose MirStructType has dropped out of the type-history.
+    let (field_types, mem_to_decl, field_offsets) = {
         if let Some(struct_ref) =
             operands_info.lookup_most_recent_of_type::<MirStructType>(ctx, aggregate)
         {
-            (struct_ref.field_types.clone(), struct_ref.memory_order())
+            let offsets = struct_ref
+                .has_explicit_layout()
+                .then(|| struct_ref.field_offsets().to_vec());
+            (struct_ref.field_types.clone(), struct_ref.memory_order(), offsets)
         } else if let Some(tuple_ref) =
             operands_info.lookup_most_recent_of_type::<MirTupleType>(ctx, aggregate)
         {
             let types = tuple_ref.get_types().to_vec();
             let identity: Vec<usize> = (0..types.len()).collect();
-            (types, identity)
+            (types, identity, None)
+        } else if is_lowered_llvm_struct(ctx, aggregate) {
+            // Operand is an already-lowered LLVM struct, whose fields are in
+            // final memory order with no further remap: the declaration index
+            // is the LLVM index directly.
+            let llvm_extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![decl_index as u32])?;
+            rewriter.insert_operation(ctx, llvm_extract.get_operation());
+            rewriter.replace_operation(ctx, op, llvm_extract.get_operation());
+            return Ok(());
         } else {
-            (vec![], vec![])
+            return pliron::input_err_noloc!(
+                "extract_field: could not recover struct/tuple layout for aggregate operand"
+            );
         }
     };
 
-    let target_field_llvm_ty = if decl_index < field_types.len() {
-        convert_type(ctx, field_types[decl_index]).map_err(anyhow_to_pliron)?
-    } else {
-        let result_ty = result.get_type(ctx);
-        convert_type(ctx, result_ty).map_err(anyhow_to_pliron)?
-    };
-
-    if is_zero_sized_type(ctx, target_field_llvm_ty) {
-        let undef_op = llvm::UndefOp::new(ctx, target_field_llvm_ty);
-        rewriter.insert_operation(ctx, undef_op.get_operation());
-        rewriter.replace_operation(ctx, op, undef_op.get_operation());
-    } else {
-        let mem_index = mem_to_decl
-            .iter()
-            .position(|&d| d == decl_index)
-            .unwrap_or(decl_index);
-
-        let llvm_index = if !field_types.is_empty() {
-            let mut idx = 0u32;
-            for i in 0..mem_index {
-                let decl_idx = mem_to_decl[i];
-                let llvm_ty = convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
-                if !is_zero_sized_type(ctx, llvm_ty) {
-                    idx += 1;
-                }
-            }
-            idx
-        } else {
-            mem_index as u32
-        };
-
-        let llvm_extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![llvm_index])?;
-        rewriter.insert_operation(ctx, llvm_extract.get_operation());
-        rewriter.replace_operation(ctx, op, llvm_extract.get_operation());
+    match llvm_field_index(ctx, &field_types, &mem_to_decl, field_offsets.as_deref(), decl_index)? {
+        None => {
+            let target_field_llvm_ty =
+                convert_type(ctx, field_types[decl_index]).map_err(anyhow_to_pliron)?;
+            let undef_op = llvm::UndefOp::new(ctx, target_field_llvm_ty);
+            rewriter.insert_operation(ctx, undef_op.get_operation());
+            rewriter.replace_operation(ctx, op, undef_op.get_operation());
+        }
+        Some(llvm_index) => {
+            let llvm_extract = llvm::ExtractValueOp::new(ctx, aggregate, vec![llvm_index])?;
+            rewriter.insert_operation(ctx, llvm_extract.get_operation());
+            rewriter.replace_operation(ctx, op, llvm_extract.get_operation());
+        }
     }
 
     Ok(())
@@ -162,47 +237,11 @@ pub(crate) fn convert_insert_field(
         None => return pliron::input_err_noloc!("Missing insert_index attribute on insert_field"),
     };
 
-    enum AggregateKind {
-        Array,
-        Struct {
-            field_types: Vec<Ptr<TypeObj>>,
-            mem_to_decl: Vec<usize>,
-        },
-        Tuple {
-            field_types: Vec<Ptr<TypeObj>>,
-            mem_to_decl: Vec<usize>,
-        },
-        Other,
-    }
-
-    let aggregate_kind = {
-        if let Some(struct_ref) =
-            operands_info.lookup_most_recent_of_type::<MirStructType>(ctx, aggregate)
-        {
-            AggregateKind::Struct {
-                field_types: struct_ref.field_types.clone(),
-                mem_to_decl: struct_ref.memory_order(),
-            }
-        } else if let Some(tuple_ref) =
-            operands_info.lookup_most_recent_of_type::<MirTupleType>(ctx, aggregate)
-        {
-            let types = tuple_ref.get_types().to_vec();
-            let identity: Vec<usize> = (0..types.len()).collect();
-            AggregateKind::Tuple {
-                field_types: types,
-                mem_to_decl: identity,
-            }
-        } else if operands_info
-            .lookup_most_recent_of_type::<MirArrayType>(ctx, aggregate)
-            .is_some()
-        {
-            AggregateKind::Array
-        } else {
-            AggregateKind::Other
-        }
-    };
-
-    if matches!(aggregate_kind, AggregateKind::Array) {
+    // Arrays index directly (no field reordering/padding).
+    if operands_info
+        .lookup_most_recent_of_type::<MirArrayType>(ctx, aggregate)
+        .is_some()
+    {
         let llvm_insert =
             llvm::InsertValueOp::new(ctx, aggregate, new_value, vec![decl_index as u32]);
         rewriter.insert_operation(ctx, llvm_insert.get_operation());
@@ -210,50 +249,45 @@ pub(crate) fn convert_insert_field(
         return Ok(());
     }
 
-    let (field_types, mem_to_decl): (Vec<Ptr<TypeObj>>, Vec<usize>) = match aggregate_kind {
-        AggregateKind::Struct {
-            field_types,
-            mem_to_decl,
-        } => (field_types, mem_to_decl),
-        AggregateKind::Tuple {
-            field_types,
-            mem_to_decl,
-        } => (field_types, mem_to_decl),
-        _ => (vec![], vec![]),
-    };
-
-    let target_field_is_zst = if decl_index < field_types.len() {
-        let llvm_ty = convert_type(ctx, field_types[decl_index]).map_err(anyhow_to_pliron)?;
-        is_zero_sized_type(ctx, llvm_ty)
-    } else {
-        false
-    };
-
-    if target_field_is_zst {
-        rewriter.replace_operation_with_values(ctx, op, vec![aggregate]);
-    } else {
-        let mem_index = mem_to_decl
-            .iter()
-            .position(|&d| d == decl_index)
-            .unwrap_or(decl_index);
-
-        let llvm_index = if !field_types.is_empty() {
-            let mut idx = 0u32;
-            for i in 0..mem_index {
-                let decl_idx = mem_to_decl[i];
-                let llvm_ty = convert_type(ctx, field_types[decl_idx]).map_err(anyhow_to_pliron)?;
-                if !is_zero_sized_type(ctx, llvm_ty) {
-                    idx += 1;
-                }
-            }
-            idx
+    // Recover struct/tuple layout (with padding info for explicit layouts);
+    // never fall back to an identity mapping (see convert_extract_field).
+    let (field_types, mem_to_decl, field_offsets) = {
+        if let Some(struct_ref) =
+            operands_info.lookup_most_recent_of_type::<MirStructType>(ctx, aggregate)
+        {
+            let offsets = struct_ref
+                .has_explicit_layout()
+                .then(|| struct_ref.field_offsets().to_vec());
+            (struct_ref.field_types.clone(), struct_ref.memory_order(), offsets)
+        } else if let Some(tuple_ref) =
+            operands_info.lookup_most_recent_of_type::<MirTupleType>(ctx, aggregate)
+        {
+            let types = tuple_ref.get_types().to_vec();
+            let identity: Vec<usize> = (0..types.len()).collect();
+            (types, identity, None)
+        } else if is_lowered_llvm_struct(ctx, aggregate) {
+            // Already-lowered LLVM struct: declaration index == LLVM index.
+            let llvm_insert =
+                llvm::InsertValueOp::new(ctx, aggregate, new_value, vec![decl_index as u32]);
+            rewriter.insert_operation(ctx, llvm_insert.get_operation());
+            rewriter.replace_operation(ctx, op, llvm_insert.get_operation());
+            return Ok(());
         } else {
-            mem_index as u32
-        };
+            return pliron::input_err_noloc!(
+                "insert_field: could not recover struct/tuple layout for aggregate operand"
+            );
+        }
+    };
 
-        let llvm_insert = llvm::InsertValueOp::new(ctx, aggregate, new_value, vec![llvm_index]);
-        rewriter.insert_operation(ctx, llvm_insert.get_operation());
-        rewriter.replace_operation(ctx, op, llvm_insert.get_operation());
+    match llvm_field_index(ctx, &field_types, &mem_to_decl, field_offsets.as_deref(), decl_index)? {
+        None => {
+            rewriter.replace_operation_with_values(ctx, op, vec![aggregate]);
+        }
+        Some(llvm_index) => {
+            let llvm_insert = llvm::InsertValueOp::new(ctx, aggregate, new_value, vec![llvm_index]);
+            rewriter.insert_operation(ctx, llvm_insert.get_operation());
+            rewriter.replace_operation(ctx, op, llvm_insert.get_operation());
+        }
     }
 
     Ok(())
@@ -283,7 +317,7 @@ pub(crate) fn convert_construct_struct(
         (result_ty, operands)
     };
 
-    let (field_types, mem_to_decl, has_explicit_layout) = {
+    let (field_types, mem_to_decl, field_offsets) = {
         let ty_ref = result_ty.deref(ctx);
         let mir_struct_ty = match ty_ref.downcast_ref::<MirStructType>() {
             Some(s) => s,
@@ -293,12 +327,16 @@ pub(crate) fn convert_construct_struct(
                 );
             }
         };
+        let offsets = mir_struct_ty
+            .has_explicit_layout()
+            .then(|| mir_struct_ty.field_offsets().to_vec());
         (
             mir_struct_ty.field_types.clone(),
             mir_struct_ty.memory_order(),
-            mir_struct_ty.has_explicit_layout(),
+            offsets,
         )
     };
+    let has_explicit_layout = field_offsets.is_some();
 
     let mut is_zst_by_decl = vec![false; field_types.len()];
     for (decl_idx, field_ty) in field_types.iter().enumerate() {
@@ -324,7 +362,6 @@ pub(crate) fn convert_construct_struct(
     rewriter.insert_operation(ctx, undef_op.get_operation());
     let mut current_struct = undef_op.get_operation().deref(ctx).get_result(0);
 
-    let mut llvm_idx = 0u32;
     let mut last_insert: Option<Ptr<Operation>> = None;
     for mem_idx in 0..field_types.len() {
         let decl_idx = mem_to_decl[mem_idx];
@@ -332,13 +369,20 @@ pub(crate) fn convert_construct_struct(
             continue;
         }
 
+        // Use the padding- and reorder-aware index so the insertvalue lands at
+        // the same slot the (possibly padded) llvm_struct_ty above carries.
+        let llvm_idx =
+            match llvm_field_index(ctx, &field_types, &mem_to_decl, field_offsets.as_deref(), decl_idx)? {
+                Some(idx) => idx,
+                None => continue,
+            };
+
         let field_val = operands[decl_idx];
 
         let insert_op = llvm::InsertValueOp::new(ctx, current_struct, field_val, vec![llvm_idx]);
         rewriter.insert_operation(ctx, insert_op.get_operation());
         current_struct = insert_op.get_operation().deref(ctx).get_result(0);
         last_insert = Some(insert_op.get_operation());
-        llvm_idx += 1;
     }
 
     match last_insert {
@@ -723,7 +767,7 @@ pub(crate) fn convert_field_addr(
         None => return pliron::input_err_noloc!("MirFieldAddrOp missing field_index attribute"),
     };
 
-    let (field_types, mem_to_decl, pointee_ty) = {
+    let (field_types, mem_to_decl, field_offsets, pointee_ty) = {
         let mir_ptr_pointee =
             match operands_info.lookup_most_recent_of_type::<MirPtrType>(ctx, ptr_operand) {
                 Some(r) => r.pointee,
@@ -735,9 +779,15 @@ pub(crate) fn convert_field_addr(
         let pointee_ref = mir_ptr_pointee.deref(ctx);
         match pointee_ref.downcast_ref::<MirStructType>() {
             Some(struct_ty) => {
-                let ft = struct_ty.field_types.clone();
-                let mtd = struct_ty.memory_order();
-                (ft, mtd, mir_ptr_pointee)
+                let offsets = struct_ty
+                    .has_explicit_layout()
+                    .then(|| struct_ty.field_offsets().to_vec());
+                (
+                    struct_ty.field_types.clone(),
+                    struct_ty.memory_order(),
+                    offsets,
+                    mir_ptr_pointee,
+                )
             }
             None => {
                 return pliron::input_err_noloc!(
@@ -747,32 +797,16 @@ pub(crate) fn convert_field_addr(
         }
     };
 
-    let mem_index = match mem_to_decl
-        .iter()
-        .position(|&decl_idx| decl_idx == field_index)
-    {
+    // GEP must use the LLVM struct field index, which honors reorder and (for
+    // explicit layouts) the `[N x i8]` padding fields.
+    let llvm_field_idx = match llvm_field_index(ctx, &field_types, &mem_to_decl, field_offsets.as_deref(), field_index)? {
         Some(idx) => idx,
         None => {
-            return pliron::input_err_noloc!(
-                "Field index {} not found in memory order mapping",
-                field_index
-            );
+            // ZST field: its address is the struct address.
+            rewriter.replace_operation_with_values(ctx, op, vec![ptr_operand]);
+            return Ok(());
         }
     };
-
-    let mut llvm_field_idx = 0u32;
-    for i in 0..mem_index {
-        let decl_idx = mem_to_decl[i];
-        if !is_zero_sized_type(ctx, field_types[decl_idx]) {
-            llvm_field_idx += 1;
-        }
-    }
-
-    let target_is_zst = is_zero_sized_type(ctx, field_types[field_index]);
-    if target_is_zst {
-        rewriter.replace_operation_with_values(ctx, op, vec![ptr_operand]);
-        return Ok(());
-    }
 
     let llvm_struct_ty = convert_type(ctx, pointee_ty).map_err(anyhow_to_pliron)?;
 
