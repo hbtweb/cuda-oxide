@@ -1,0 +1,38 @@
+[package]
+name = "struct_field_reorder"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+
+# Standalone crate, not part of the parent workspace.
+[workspace]
+
+# Regression guard for the aggregate field-index lowering fix. A generic
+# `ScratchArena<S>` (from the sibling `arena_core` crate) is a `repr(Rust)`
+# struct whose fields rustc REORDERS in memory (alignment-descending); the
+# kernel builds it on the device, drives it through `&self` methods across the
+# crate boundary, and the host verifies every field landed at its
+# layout-computed index. Pre-fix this FAILS device codegen (LLVM module
+# verification rejects an `insert_value` whose index lands on the struct's
+# `[N x i8]` padding field); post-fix it builds and every field verifies.
+# Self-contained and var-mem-free.
+#
+# Build with:
+#   cargo oxide run struct_field_reorder
+
+[dependencies]
+cuda-core = { path = "../../../cuda-core" }
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+# Generic arena lives in a SEPARATE crate so its `&self` field accesses are
+# monomorphized across the crate boundary — the shape that reproduces the
+# field-index lowering bug.
+arena_core = { path = "./arena_core" }
+
+# Keep optimization from scalarizing the reordered/padded struct into SSA
+# scalars before lowering: the field-index bug only surfaces when the
+# extract_field / insert_field / field_addr / construct_struct ops actually
+# reach `dialect-mir` -> LLVM lowering carrying the reordered MirStructType.
+[profile.release]
+opt-level = 0

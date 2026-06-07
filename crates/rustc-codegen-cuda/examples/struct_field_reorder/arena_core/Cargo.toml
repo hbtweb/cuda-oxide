@@ -1,0 +1,15 @@
+[package]
+name = "arena_core"
+version = "0.1.0"
+edition = "2021"
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+
+# A generic bump arena over a `CellStore`, kept in a SEPARATE crate on purpose:
+# the field-index lowering bug only surfaces when the generic `&self`
+# receiver's `MirStructType` is reconstructed across the crate boundary at
+# monomorphization (the same shape as var-mem-core's ScratchArena, but
+# self-contained here). It is a member of the example crate's workspace.
+
+[lib]
+name = "arena_core"

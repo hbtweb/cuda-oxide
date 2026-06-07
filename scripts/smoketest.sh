@@ -33,6 +33,10 @@ set -uo pipefail
 
 # ---- Example categorization ---------------------------------------------
 
+# Note: plain execution-must-succeed examples (e.g. struct_field_reorder, the
+# aggregate field-index reorder/padding regression guard) need no entry here —
+# they are auto-discovered below and default to the `standard` category, which
+# requires a SUCCESS/PASS/Complete marker in their output.
 TCGEN05_EXAMPLES=(gemm_sol tcgen05 tcgen05_matmul)
 WGMMA_EXAMPLES=(wgmma)
 LTOIR_EXAMPLES=(addressof_sharedarray_repro cpp_consumes_rust_device device_ffi_test manual_launch_libdevice mathdx_ffi_test primitive_stress)
