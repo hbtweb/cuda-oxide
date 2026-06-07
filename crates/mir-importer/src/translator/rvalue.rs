@@ -3290,6 +3290,23 @@ fn pointer_pointee_kind(ctx: &Context, ptr_value: Value) -> Option<(PointeeKind,
     Some((kind, addr_space))
 }
 
+/// Extract the element type of an array or slice Rust type.
+///
+/// Used by [`translate_place_iterative`] to narrow `current_rust_ty` when an
+/// `Index` / `ConstantIndex` projection steps into an array/slice element, so a
+/// subsequent `Downcast`/`Field` on an enum element sees the element ADT type
+/// rather than the (stale) outer `Array`/`Slice` type.
+fn element_rust_ty(ty: rustc_public::ty::Ty) -> TranslationResult<rustc_public::ty::Ty> {
+    use rustc_public::ty::{RigidTy, TyKind};
+    match ty.kind() {
+        TyKind::RigidTy(RigidTy::Array(elem, _)) | TyKind::RigidTy(RigidTy::Slice(elem)) => Ok(elem),
+        other => input_err_noloc!(TranslationErr::unsupported(format!(
+            "Index on non-array/slice type: {:?}",
+            other
+        ))),
+    }
+}
+
 /// Translate a MIR Place using iterative projection processing.
 /// This handles arbitrary depth projections by processing each element in sequence.
 pub fn translate_place_iterative(
@@ -3520,6 +3537,10 @@ pub fn translate_place_iterative(
                         );
                     }
                 }
+                // Narrow the running Rust type to the element type so a
+                // following Downcast/Field on an enum element resolves against
+                // the element ADT, not the outer Array/Slice (FIX C).
+                current_rust_ty = element_rust_ty(current_rust_ty)?;
                 pending_downcast = None;
             }
 
@@ -3681,6 +3702,9 @@ pub fn translate_place_iterative(
                         );
                     }
                 }
+                // Narrow the running Rust type to the element type (FIX C);
+                // covers `match xs[0]` (constant index into an enum array).
+                current_rust_ty = element_rust_ty(current_rust_ty)?;
                 pending_downcast = None;
             }
 

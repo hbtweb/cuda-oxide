@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "enum_array_match"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nihal Pasham <nihalp@nvidia.com>"]
+license = "Apache-2.0"
+
+# Standalone crate, not part of the parent workspace.
+[workspace]
+
+# Regression guard for the enum-in-array `match` projection fix (sibling of the
+# reordered-struct field-index fix). `match xs[i]` lowers to a projection chain
+# [Index, Downcast, Field]; the importer's iterative place walker advanced the
+# SSA value in the Index/ConstantIndex arms but left the running Rust type at
+# the outer `Array(Adt(E), N)`, so the Downcast/Field step errored
+# `Downcast on non-ADT type: Array`. The fix narrows the running type to the
+# array/slice element in both index arms.
+#
+# Build with:
+#   cargo oxide run enum_array_match
+
+[dependencies]
+cuda-core = { path = "../../../cuda-core" }
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+
+# Keep optimization from scalarizing the enum array into SSA scalars before the
+# importer runs: the [Index, Downcast, Field] chain only reaches the place
+# walker when the array projection actually appears in the MIR.
+[profile.release]
+opt-level = 0
