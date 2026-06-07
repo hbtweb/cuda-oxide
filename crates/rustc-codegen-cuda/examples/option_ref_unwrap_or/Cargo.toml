@@ -1,0 +1,34 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "option_ref_unwrap_or"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone crate, not part of the parent workspace.
+[workspace]
+
+# Regression guard for the `Option<&T>` reference-to-scalar constant import
+# fix. With a `Some`/`None` pair of `Option<&u32>` live in one frame, rustc -O
+# const-folds `None.unwrap_or(&77)` to a reference-to-SCALAR constant `&77`
+# (a `ConstantKind::Allocated` whose 8 pointer bytes are a zero relocation
+# placeholder, with the real `77` allocation in `alloc.provenance.ptrs`).
+#
+# The importer's pointer-constant arm followed provenance only for STRUCT
+# pointees; a scalar pointee fell through to the raw-pointer branch and emitted
+# `inttoptr i64 0`, dropping the relocation -> `load i32, ptr null` => CUDA 700
+# / garbage at the deref. The fix follows provenance for a scalar pointee too,
+# materializing the pointee value and wrapping it in `mir.ref`.
+#
+# Pre-fix `out[1]` is a null deref (CUDA 700 / garbage); post-fix the kernel
+# runs and out[0]==5, out[1]==77.
+#
+# Build with:
+#   cargo oxide run option_ref_unwrap_or
+
+[dependencies]
+cuda-core = { path = "../../../cuda-core" }
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }

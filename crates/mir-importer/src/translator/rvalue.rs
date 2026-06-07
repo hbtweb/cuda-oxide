@@ -2238,70 +2238,131 @@ pub fn translate_operand(
                     );
                 }
 
-                let has_struct_data = if pointee_is_struct {
-                    match constant.const_.kind() {
-                        ConstantKind::Allocated(alloc) => {
-                            // For promoted constants like &(8..16), the bytes are zeros
-                            // (pointer placeholder) but provenance indicates a real allocation.
-                            // Check for provenance OR non-zero bytes.
-                            let has_provenance = !alloc.provenance.ptrs.is_empty();
-                            let has_nonzero_bytes = alloc
-                                .raw_bytes()
-                                .ok()
-                                .map(|bytes| bytes.iter().any(|&b| b != 0))
-                                .unwrap_or(false);
-                            has_provenance || has_nonzero_bytes
-                        }
-                        ConstantKind::Ty(_) => {
-                            // Promoted constants (like &(8..16)) are Ty variants
-                            // These contain the actual struct data
-                            true
-                        }
-                        _ => false,
+                // Does this pointer constant reference a real allocation (rather
+                // than being a plain raw pointer like `core::ptr::null()`)?
+                //
+                // This fires for BOTH struct pointees (e.g. `&(8..16)`) and scalar
+                // pointees (e.g. rustc const-folding `None.unwrap_or(&77)` to `&77`,
+                // a `ConstantKind::Allocated` whose 8 pointer bytes are a zero
+                // relocation placeholder with the real target in
+                // `alloc.provenance.ptrs`). Previously only struct pointees were
+                // followed; a scalar pointee fell through to the raw-pointer branch
+                // below and emitted `inttoptr i64 0`, dropping provenance and
+                // producing a null deref (CUDA 700) at the later load.
+                let has_provenance_data = match constant.const_.kind() {
+                    ConstantKind::Allocated(alloc) => {
+                        let has_provenance = !alloc.provenance.ptrs.is_empty();
+                        let has_nonzero_bytes = alloc
+                            .raw_bytes()
+                            .ok()
+                            .map(|bytes| bytes.iter().any(|&b| b != 0))
+                            .unwrap_or(false);
+                        has_provenance || has_nonzero_bytes
                     }
-                } else {
-                    false
+                    // Promoted constants (like &(8..16)) are Ty variants and carry
+                    // the actual pointee data.
+                    ConstantKind::Ty(_) => true,
+                    _ => false,
                 };
 
-                if has_struct_data {
-                    // This is a reference to a constant struct (like &(8..16))
+                if has_provenance_data {
+                    if pointee_is_struct {
+                        // Reference to a constant struct (like &(8..16)):
+                        // build the struct value, then mir.ref to get a pointer.
+                        let (struct_val, last_op) = translate_struct_constant(
+                            ctx,
+                            constant,
+                            &rust_ty,
+                            pointee_ty,
+                            block_ptr,
+                            prev_op,
+                            loc.clone(),
+                        )?;
 
-                    // Create the struct constant, then use mir.ref to get a pointer
-                    let (struct_val, last_op) = translate_struct_constant(
-                        ctx,
-                        constant,
-                        &rust_ty,
-                        pointee_ty,
-                        block_ptr,
-                        prev_op,
-                        loc.clone(),
-                    )?;
+                        use dialect_mir::ops::MirRefOp;
+                        let ref_op = Operation::new(
+                            ctx,
+                            MirRefOp::get_concrete_op_info(),
+                            vec![const_ty_ptr], // Result is pointer to struct
+                            vec![struct_val],   // Operand is the struct value
+                            vec![],
+                            0,
+                        );
+                        ref_op.deref_mut(ctx).set_loc(loc);
 
-                    // Now create mir.ref to get a pointer to the struct
-                    use dialect_mir::ops::MirRefOp;
-                    let ref_op = Operation::new(
-                        ctx,
-                        MirRefOp::get_concrete_op_info(),
-                        vec![const_ty_ptr], // Result is pointer to struct
-                        vec![struct_val],   // Operand is the struct value
-                        vec![],
-                        0,
-                    );
-                    ref_op.deref_mut(ctx).set_loc(loc);
+                        let mir_ref = MirRefOp::new(ref_op);
+                        mir_ref.set_attr_mutable(
+                            ctx,
+                            dialect_mir::attributes::MutabilityAttr(is_mutable),
+                        );
 
-                    let mir_ref = MirRefOp::new(ref_op);
+                        if let Some(prev) = last_op {
+                            mir_ref.get_operation().insert_after(ctx, prev);
+                        } else {
+                            mir_ref.get_operation().insert_at_front(block_ptr, ctx);
+                        }
 
-                    mir_ref
-                        .set_attr_mutable(ctx, dialect_mir::attributes::MutabilityAttr(is_mutable));
-
-                    if let Some(prev) = last_op {
-                        mir_ref.get_operation().insert_after(ctx, prev);
+                        let ptr_val = mir_ref.get_operation().deref(ctx).get_result(0);
+                        return Ok((ptr_val, Some(mir_ref.get_operation())));
                     } else {
-                        mir_ref.get_operation().insert_at_front(block_ptr, ctx);
-                    }
+                        // Reference to a SCALAR constant (like `&77`): follow the
+                        // provenance to the target allocation's bytes, materialize
+                        // the pointee value, then mir.ref to get a pointer to it.
+                        // Without this we would fall through and emit a null
+                        // pointer, dropping the relocation -> CUDA 700 on deref.
+                        if let Some(target_bytes) =
+                            follow_provenance_target_bytes(constant, &loc)?
+                        {
+                            // Pointee Rust type, for value materialization.
+                            let pointee_rust_ty = get_static_pointer_info(&rust_ty)
+                                .map(|(p, _)| p)
+                                .ok_or_else(|| {
+                                    input_error_noloc!(TranslationErr::unsupported(
+                                        "reference-to-scalar constant on a non-ref/ptr type"
+                                            .to_string(),
+                                    ))
+                                })?;
 
-                    let ptr_val = mir_ref.get_operation().deref(ctx).get_result(0);
-                    return Ok((ptr_val, Some(mir_ref.get_operation())));
+                            let (pointee_val, last_op) = translate_constant_value_from_bytes(
+                                ctx,
+                                &pointee_rust_ty,
+                                pointee_ty,
+                                &target_bytes,
+                                block_ptr,
+                                prev_op,
+                                loc.clone(),
+                            )?;
+
+                            use dialect_mir::ops::MirRefOp;
+                            let ref_op = Operation::new(
+                                ctx,
+                                MirRefOp::get_concrete_op_info(),
+                                vec![const_ty_ptr],  // Result: pointer to scalar
+                                vec![pointee_val],   // Operand: the scalar value
+                                vec![],
+                                0,
+                            );
+                            ref_op.deref_mut(ctx).set_loc(loc);
+
+                            let mir_ref = MirRefOp::new(ref_op);
+                            mir_ref.set_attr_mutable(
+                                ctx,
+                                dialect_mir::attributes::MutabilityAttr(is_mutable),
+                            );
+
+                            if let Some(prev) = last_op {
+                                mir_ref.get_operation().insert_after(ctx, prev);
+                            } else {
+                                mir_ref.get_operation().insert_at_front(block_ptr, ctx);
+                            }
+
+                            let ptr_val = mir_ref.get_operation().deref(ctx).get_result(0);
+                            return Ok((ptr_val, Some(mir_ref.get_operation())));
+                        }
+                        // No followable provenance (e.g. non-zero inline bytes that
+                        // happen to be a scalar pointer literal): fall through to the
+                        // raw-pointer handling below.
+                    }
                 }
 
                 // Raw pointer constant (like core::ptr::null())
@@ -4199,6 +4260,63 @@ fn translate_ptr_to_array_constant(
     let ptr_val = ref_op.deref(ctx).get_result(0);
 
     Ok((ptr_val, Some(ref_op)))
+}
+
+/// Follow the provenance of a reference-to-constant allocation to obtain the
+/// raw bytes of the *target* allocation (the actual pointee data).
+///
+/// A `&77`-style reference constant is an `Allocated` whose own 8 pointer bytes
+/// are a relocation placeholder (zero); the real pointee lives in a separate
+/// allocation recorded in `alloc.provenance.ptrs`. This mirrors the
+/// provenance-follow snippet used by `translate_struct_constant` and
+/// `translate_ptr_to_array_constant`, but returns the bytes for any pointee
+/// (scalar or aggregate).
+fn follow_provenance_target_bytes(
+    constant: &mir::ConstOperand,
+    loc: &Location,
+) -> TranslationResult<Option<Vec<u8>>> {
+    let ConstantKind::Allocated(alloc) = constant.const_.kind() else {
+        return Ok(None);
+    };
+    let Some((_, prov)) = alloc.provenance.ptrs.first() else {
+        return Ok(None);
+    };
+    use rustc_public::mir::alloc::GlobalAlloc;
+    let alloc_id = prov.0;
+    let bytes = match GlobalAlloc::from(alloc_id) {
+        GlobalAlloc::Memory(target_alloc) => target_alloc.raw_bytes().ok().unwrap_or_else(|| {
+            target_alloc
+                .bytes
+                .iter()
+                .map(|opt: &Option<u8>| opt.unwrap_or(0))
+                .collect::<Vec<u8>>()
+        }),
+        GlobalAlloc::Static(static_def) => {
+            let target_alloc = static_def.eval_initializer().map_err(|e| {
+                input_error_noloc!(TranslationErr::unsupported(format!(
+                    "Failed to evaluate static initializer for reference constant: {:?}",
+                    e
+                )))
+            })?;
+            target_alloc.raw_bytes().ok().unwrap_or_else(|| {
+                target_alloc
+                    .bytes
+                    .iter()
+                    .map(|opt: &Option<u8>| opt.unwrap_or(0))
+                    .collect::<Vec<u8>>()
+            })
+        }
+        other => {
+            return input_err!(
+                loc.clone(),
+                TranslationErr::unsupported(format!(
+                    "Reference constant provenance points to non-memory allocation: {:?}",
+                    other
+                ))
+            );
+        }
+    };
+    Ok(Some(bytes))
 }
 
 /// ## How it works
