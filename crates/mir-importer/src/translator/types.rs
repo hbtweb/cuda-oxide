@@ -728,6 +728,25 @@ pub fn translate_type(
         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Pat(base_ty, _pat)) => {
             translate_type(ctx, &base_ty)
         }
+        // Function-item (`fn foo {foo}`, the zero-sized type of a named fn) and
+        // function-pointer (`fn(T) -> U`) types. Both translate to a generic
+        // opaque pointer: a fn-item is zero-sized but carries a callable
+        // identity, and a fn pointer is an ordinary code address. Mapping the
+        // TYPE unblocks import wherever such a value is merely stored, passed,
+        // or compared. NOTE: this is type translation only — lowering an
+        // INDIRECT call through a fn pointer is a separate concern (PTX has
+        // limited support for indirect calls) and is not handled here.
+        rustc_public::ty::TyKind::RigidTy(
+            rustc_public::ty::RigidTy::FnDef(..) | rustc_public::ty::RigidTy::FnPtr(..),
+        ) => {
+            let u8_ty = pliron::builtin::types::IntegerType::get(
+                ctx,
+                8,
+                pliron::builtin::types::Signedness::Unsigned,
+            )
+            .into();
+            Ok(MirPtrType::get_generic(ctx, u8_ty, false).into())
+        }
         _ => input_err_noloc!(TranslationErr::unsupported(format!(
             "Type translation not yet implemented for: {:?}",
             ty_kind

@@ -1,0 +1,17 @@
+[package]
+name = "fn_ptr_type_repro"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace]
+
+[dependencies]
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
+cuda-core = { path = "../../../cuda-core" }
+
+# Keep the fn-item / fn-pointer values from being optimized away before the
+# type translation runs.
+[profile.release]
+opt-level = 0
