@@ -916,6 +916,8 @@ pub fn translate_rvalue(
             if let Some(slot) = value_map.get_slot(place.local)
                 && let Some((result_val, last_inserted)) = translate_place_addr_from_slot(
                     ctx,
+                    body,
+                    value_map,
                     slot,
                     &place.projection,
                     is_mutable,
@@ -3320,9 +3322,10 @@ fn apply_enum_field_projection(
 ///
 /// - `Field(idx, _)`   → [`MirFieldAddrOp`]
 /// - `ConstantIndex {offset, from_end: false, ..}` → `MirConstantOp` + [`MirArrayElementAddrOp`]
-/// - `Index(local)`    → `load_local(local)` + [`MirArrayElementAddrOp`]
-/// - `Deref`           → load the pointer; subsequent projections apply to
-///   the pointee.
+/// - `Index(local)`    → load the index local + [`MirArrayElementAddrOp`]
+/// - `Deref`           → load the inner pointer; subsequent projections apply
+///   to the pointee. The load result MUST stay a pointer so the next
+///   projection can address into the pointee (e.g. `&mut (*arr)[i]`).
 ///
 /// Returns `Ok(Some((addr, last_op)))` on success, `Ok(None)` if the
 /// projection chain contains an element this helper doesn't know how to
@@ -3334,6 +3337,8 @@ fn apply_enum_field_projection(
 /// final result pointer also carries this mutability.
 fn translate_place_addr_from_slot(
     ctx: &mut Context,
+    body: &mir::Body,
+    value_map: &ValueMap,
     slot: Value,
     projection: &[mir::ProjectionElem],
     is_mutable: bool,
@@ -3341,7 +3346,9 @@ fn translate_place_addr_from_slot(
     prev_op: Option<Ptr<Operation>>,
     loc: Location,
 ) -> TranslationResult<Option<(Value, Option<Ptr<Operation>>)>> {
-    use dialect_mir::ops::{MirArrayElementAddrOp, MirConstantOp, MirFieldAddrOp};
+    use dialect_mir::ops::{
+        MirArrayElementAddrOp, MirConstantOp, MirFieldAddrOp, MirLoadOp,
+    };
 
     let mut current = slot;
     let mut current_prev_op = prev_op;
@@ -3430,10 +3437,99 @@ fn translate_place_addr_from_slot(
                 current_prev_op = Some(addr_op);
             }
 
-            // Remaining projection kinds (Deref, Index(runtime), Downcast,
-            // Subslice, ...) aren't lowered to addresses here yet. Punt to the
-            // caller, which will fall back to materialising a value and
-            // wrapping it in `MirRefOp`.
+            // `Deref` — `current` points at a pointer-typed slot (e.g. the slot
+            // of a `&mut [f32; N]` local is `*mut *mut [f32; N]`). Load the
+            // INNER pointer so the result stays a pointer and subsequent
+            // projections (e.g. the following `Index`) can address into the
+            // pointee. Without this, `&mut (*arr)[i]` falls through to the
+            // caller's `MirRefOp` path, which materializes the element as a
+            // loaded VALUE and stores the copy in a fresh slot — so the write
+            // `*e = ...` hits the copy, not the array (a silently dropped write).
+            mir::ProjectionElem::Deref => {
+                let pointee = {
+                    let cur_ty = current.get_type(ctx);
+                    let cur_ty_ref = cur_ty.deref(ctx);
+                    match cur_ty_ref.downcast_ref::<dialect_mir::types::MirPtrType>() {
+                        Some(ptr_ty) => ptr_ty.pointee,
+                        // Not a thin pointer (e.g. a slice fat pointer): this
+                        // helper can't address through it — punt to the caller.
+                        None => return Ok(None),
+                    }
+                };
+                let op = Operation::new(
+                    ctx,
+                    MirLoadOp::get_concrete_op_info(),
+                    vec![pointee],
+                    vec![current],
+                    vec![],
+                    0,
+                );
+                op.deref_mut(ctx).set_loc(loc.clone());
+                match current_prev_op {
+                    Some(p) => op.insert_after(ctx, p),
+                    None => op.insert_at_front(block_ptr, ctx),
+                }
+                current = op.deref(ctx).get_result(0);
+                current_prev_op = Some(op);
+            }
+
+            // `Index(local)` — runtime index into an array pointee. Mirror the
+            // `ConstantIndex` arm but load the index from `local` instead of
+            // emitting a constant. Only valid when `current` points at an array
+            // (after a preceding `Deref` of a `&mut [T; N]`, say); otherwise
+            // punt so the caller can fall back.
+            mir::ProjectionElem::Index(index_local) => {
+                let (element_ty, addr_space) = match pointer_pointee_kind(ctx, current) {
+                    Some(kind) => kind,
+                    None => return Ok(None),
+                };
+                let element_ty = match element_ty {
+                    PointeeKind::Array(elem_ty) => elem_ty,
+                    PointeeKind::Other => return Ok(None),
+                };
+
+                // Load the index local (a `usize`). Reuse `translate_place`,
+                // which loads the local's slot — the same pattern the runtime
+                // `Index` arm in `translate_place_iterative` uses.
+                let index_place = mir::Place {
+                    local: *index_local,
+                    projection: vec![],
+                };
+                let (index_val, next_prev_op) = translate_place(
+                    ctx,
+                    body,
+                    &index_place,
+                    value_map,
+                    block_ptr,
+                    current_prev_op,
+                    loc.clone(),
+                )?;
+                current_prev_op = next_prev_op;
+
+                let elem_ptr_ty =
+                    dialect_mir::types::MirPtrType::get(ctx, element_ty, is_mutable, addr_space)
+                        .into();
+                let addr_op = Operation::new(
+                    ctx,
+                    MirArrayElementAddrOp::get_concrete_op_info(),
+                    vec![elem_ptr_ty],
+                    vec![current, index_val],
+                    vec![],
+                    0,
+                );
+                addr_op.deref_mut(ctx).set_loc(loc.clone());
+                match current_prev_op {
+                    Some(p) => addr_op.insert_after(ctx, p),
+                    None => addr_op.insert_at_front(block_ptr, ctx),
+                }
+                current = addr_op.deref(ctx).get_result(0);
+                current_prev_op = Some(addr_op);
+            }
+
+            // Remaining projection kinds (Downcast, Subslice, from-end
+            // ConstantIndex, ...) aren't lowered to addresses here yet. Punt to
+            // the caller, which falls back to materialising a value and wrapping
+            // it in `MirRefOp`.
             _ => return Ok(None),
         }
     }

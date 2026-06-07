@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "ref_array_elem_write"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+# Standalone crate, not part of the parent workspace.
+[workspace]
+
+# Regression guard for `&mut (*arr)[i]` writes through a referenced array
+# element being silently dropped. Taking `&mut arr[i]` where
+# `arr: &mut [f32; N]` lowers to `Rvalue::Ref(place = [Deref, Index])`. The
+# importer's `translate_place_addr_from_slot` punted on a leading `Deref`, so
+# the `Rvalue::Ref` arm fell through to its `MirRefOp` fallback, which stored
+# the write into a COPY of the element in a fresh slot instead of the array.
+#
+# The fix teaches the address helper to address through `Deref` (load the inner
+# pointer) and runtime `Index` (emit `MirArrayElementAddrOp`), so the write
+# lands in the real array.
+#
+# Pre-fix the elements stay 0; post-fix they are 42.0.
+#
+# Build with:
+#   cargo oxide run ref_array_elem_write
+
+[dependencies]
+cuda-core = { path = "../../../cuda-core" }
+cuda-device = { path = "../../../cuda-device" }
+cuda-host = { path = "../../../cuda-host" }
