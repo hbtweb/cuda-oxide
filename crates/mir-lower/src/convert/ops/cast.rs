@@ -474,6 +474,34 @@ fn emit_pointer_cast(
         )
     } else if src_is_struct && llvm_ty.deref(ctx).is::<IntegerType>() {
         emit_struct_to_scalar(ctx, rewriter, val, val_ty, llvm_ty)
+    } else if val_ty.deref(ctx).is::<llvm_export::types::ArrayType>()
+        && llvm_ty.deref(ctx).is::<IntegerType>()
+    {
+        // array → integer Transmute (e.g. `u32::from_ne_bytes([u8; 4])`,
+        // `u64::from_le_bytes([u8; 8])`). The source is an LLVM `[N x i8]`
+        // and the destination an `iN`; LLVM forbids `bitcast [N x i8] to iN`
+        // because aggregates and scalars are not first-class-bitcastable.
+        // Round-trip through memory instead: alloca + store + load, the same
+        // shape the struct → struct arm above uses. Little-endian byte order
+        // matches `from_ne_bytes`/`from_le_bytes` on the LE NVPTX target.
+        //
+        // The alloca is typed as the DESTINATION integer (`llvm_ty`), not the
+        // `[N x i8]` source: a `[N x i8]` alloca has only 1-byte alignment, so
+        // the subsequent `load iN` would read from a possibly-misaligned slot
+        // (observed as a runtime "misaligned address" fault). Allocating `iN`
+        // gives the slot iN's natural alignment; storing the same-sized
+        // `[N x i8]` value into it is valid (opaque pointers — only size and
+        // alignment of the slot matter). Closes the issue-#125 class of
+        // illegal aggregate→scalar bitcasts.
+        let one = const_i64(ctx, rewriter, 1);
+        let alloca = llvm::AllocaOp::new(ctx, llvm_ty, one);
+        rewriter.insert_operation(ctx, alloca.get_operation());
+        let ptr = alloca.get_operation().deref(ctx).get_result(0);
+
+        let store = llvm::StoreOp::new(ctx, val, ptr);
+        rewriter.insert_operation(ctx, store.get_operation());
+
+        Ok(llvm::LoadOp::new(ctx, ptr, llvm_ty).get_operation())
     } else {
         Ok(llvm::BitcastOp::new(ctx, val, llvm_ty).get_operation())
     }
